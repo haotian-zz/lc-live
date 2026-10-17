@@ -1,104 +1,107 @@
 # lc-live
 
-在 Chrome 里写 LeetCode 时，**边写边用本机 javac 实时报错**（红色波浪线 + 行尾错误提示），不依赖 LeetCode 自带的、经常断掉的 Auto 检查。
+English | [中文](README.zh-CN.md)
 
-目前支持 **Java**。
+**Live javac errors and IDE-style completion inside the LeetCode editor in Chrome**, powered by a compiler running on your own machine. No dependency on LeetCode's flaky built-in "Auto" assistant.
+
+Currently supports **Java**.
 
 ```
-LeetCode 页面 (Monaco 编辑器)
-   │ inject.js 读取编辑器内容，停顿 400ms 后发送
+LeetCode page (Monaco editor)
+   │ inject.js reads the buffer, sends it 400 ms after you stop typing
    ▼
-Chrome 扩展 background.js  ──POST /compile──▶  本机 Java 编译服务 (127.0.0.1:47321)
-   ▲                                              内存中 javac，一次 ~15ms
-   └── 返回诊断 → setModelMarkers 画波浪线 + 行尾提示 + 右下角状态
+Chrome extension background.js  ──POST /compile──▶  local Java compile server (127.0.0.1:47321)
+   ▲                                                 in-memory javac, ~15 ms per request
+   └── diagnostics → setModelMarkers squiggles + end-of-line hints + status pill
 ```
 
-## 1. 启动编译服务（二选一）
+## 1. Start the compile server (pick one)
 
-### 方式 A：Docker（推荐，自带 JDK 21，和 LeetCode 一致）
+### Option A: Docker (recommended, ships JDK 21 like LeetCode)
 
 ```bash
 server/docker-up.sh      # = docker compose up -d --build
 ```
 
-容器 `restart: unless-stopped`，docker daemon 一起来它就跟着起；端口只发布到 `127.0.0.1:47321`。
-daemon 本身的开机自启由你的 docker 后端负责，例如 colima：`brew services start colima`。
+The container uses `restart: unless-stopped`, so it comes back whenever the Docker daemon starts. The port is published to `127.0.0.1:47321` only.
+Whether the daemon itself starts at login is up to your Docker backend, e.g. for colima: `brew services start colima`.
 
-常用命令：`docker logs lc-live`、`docker compose stop`、`docker compose down`。
+Useful commands: `docker logs lc-live`, `docker compose stop`, `docker compose down`.
 
-### 方式 B：本机 JDK（需要 JDK 11+）
+### Option B: local JDK (11+)
 
 ```bash
-server/start.sh                  # 前台运行
-server/install-launchd.sh        # 安装 macOS LaunchAgent：登录自启 + 挂掉自动拉起（卸载: server/uninstall-launchd.sh）
+server/start.sh                  # run in the foreground
+server/install-launchd.sh        # macOS LaunchAgent: starts at login, restarts if it dies (undo: server/uninstall-launchd.sh)
 ```
 
-想用 Java 21，把 `JAVA_HOME` 指向 JDK 21 再执行脚本。
+Point `JAVA_HOME` at a JDK 21 before running the script if you want parity with LeetCode.
 
-两种方式都监听 47321，不要同时开。验证：`curl http://127.0.0.1:47321/health`
+Both options listen on 47321, so run only one. Verify with `curl http://127.0.0.1:47321/health`.
 
-## 2. 安装 Chrome 扩展
+## 2. Install the Chrome extension
 
-1. 打开 `chrome://extensions`，右上角打开「开发者模式」
-2. 「加载已解压的扩展程序」→ 选择本仓库的 `extension/` 目录
-3. 打开任意 LeetCode 题目（leetcode.com / leetcode.cn），编辑器右下角会出现状态胶囊：
-   - `✓ Java OK · 14ms` 编译通过
-   - `✗ 2 errors` 有错误，对应行有红色波浪线和行尾提示，悬停看完整信息
-   - `lc-live: server offline` 编译服务没起来，点一下重试
-   - 点击胶囊可以临时开关
+1. Open `chrome://extensions` and enable **Developer mode** (top right).
+2. Click **Load unpacked** and select the `extension/` folder of this repo.
+3. Open any problem on leetcode.com or leetcode.cn and pick Java. A small pill appears at the bottom right of the editor:
+   - `✓ Java OK · 14ms`: compiles cleanly
+   - `✗ 2 errors`: offending lines get a red squiggle plus an end-of-line hint; hover for the full message
+   - `lc-live: server offline`: the compile server is unreachable; click to retry
+   - Click the pill to toggle the feature on and off
 
-点扩展图标可以看到服务状态、改端口。
+Click the extension icon to see server status or change the port.
 
-## 自动补全
+## Completion
 
-装好后编辑器自带 IDE 式补全（扩展会把 LeetCode 默认关闭的 quickSuggestions 打开）：
+Once installed, the editor gets IDE-style completion (the extension turns on `quickSuggestions`, which LeetCode ships disabled):
 
-- 输入类名前缀弹出候选：`ArrayDe` → `ArrayDeque`，也支持驼峰缩写 `ADe`、`HM` → `HashMap`
-- 输入 `.` 后列出成员，带参数和返回类型，泛型已代入：`dq.pe` → `peek() : Integer`
-- 静态成员：`Math.`、`Collections.`、`Integer.`
-- 作用域内的局部变量、参数、当前类的字段和方法；`this.`、数组的 `length`、链式调用结果
-- 题目注释里定义的 `ListNode` / `TreeNode` 的成员
-- 选中方法后插入 `name(` + 光标 + `)`；无参方法直接插入 `name()`
-- 注释和字符串里不触发
+- Type a class-name prefix: `ArrayDe` → `ArrayDeque`; camel-hump abbreviations work too (`ADe`, `HM` → `HashMap`)
+- After `.`, members with parameter and return types, generics substituted: `dq.pe` → `peek() : Integer`
+- Static members: `Math.`, `Collections.`, `Integer.`
+- Locals, parameters, fields and methods of the current class; `this.`, array `length`, results of chained calls
+- Members of `ListNode` / `TreeNode` as defined in the problem's comment block
+- Picking a method inserts `name(` + caret + `)`; parameterless methods insert `name()`
+- Nothing triggers inside comments or strings
 
-补全和报错共用同一个服务，每次约 10–30 ms。报错文字用 CSS 伪元素绘制，不能被选中或复制，光标也不会落在上面。
+Completion and diagnostics share one server; each request takes 10–30 ms. End-of-line error text is drawn with a CSS pseudo-element, so it cannot be selected or copied and the caret never lands on it.
 
-## 行为细节
+## Behaviour details
 
-- 自动补上 LeetCode 隐式导入的包（`java.util.*`、`java.util.stream.*`、`java.math.*` 等），行号已对齐
-- 自动识别题目注释里的 `ListNode` / `TreeNode` / `Node` / `NestedInteger` 等定义并参与编译；注释被删掉时使用内置兜底 stub
-- 支持 `GuessGame`、`VersionControl`、`MountainArray`、`Relation` 等交互题的父类/接口 stub
-- 设计题（如 `class LRUCache`）、多个类、`public class Solution` 都能编译
-- 只有编译错误，不运行代码，不上传任何内容（服务只监听 127.0.0.1）
+- Adds the imports LeetCode adds implicitly (`java.util.*`, `java.util.stream.*`, `java.math.*`, …); line numbers are mapped back correctly
+- Extracts `ListNode` / `TreeNode` / `Node` / `NestedInteger` definitions from the problem's comment block and compiles them; falls back to built-in stubs if the comment was deleted
+- Provides stubs for interactive-problem parents such as `GuessGame`, `VersionControl`, `MountainArray`, `Relation`
+- Design problems (`class LRUCache`), multiple classes and `public class Solution` all compile
+- Compile errors only: your code is never executed and never leaves the machine (the server listens on 127.0.0.1 only)
 
-## 设计文档
+## Design document
 
-架构、数据流、补全算法和关键取舍见 [docs/DESIGN.md](docs/DESIGN.md)。
+Architecture, data flows, the completion algorithm and the key trade-offs are in [docs/DESIGN.md](docs/DESIGN.md) ([中文](docs/DESIGN.zh-CN.md)).
 
-## 目录
+## Layout
 
 ```
-server/LcLiveServer.java     零依赖编译服务（java 单文件直接运行）
-server/start.sh              前台启动
-server/install-launchd.sh    安装 LaunchAgent 自启动
-server/docker-up.sh          构建镜像并启动容器
-Dockerfile / compose.yml     容器定义（JDK 21，restart: unless-stopped）
-extension/manifest.json      MV3 扩展
-extension/inject.js          MAIN world：挂 Monaco、画标记
-extension/bridge.js          ISOLATED world：页面 ↔ 扩展消息中转
-extension/background.js      Service worker：请求本机服务
-extension/popup.*            扩展弹窗（服务状态 / 端口）
+server/LcLiveServer.java     zero-dependency compile server (single-file java launch)
+server/start.sh              run in the foreground
+server/install-launchd.sh    install the LaunchAgent
+server/docker-up.sh          build the image and start the container
+Dockerfile / compose.yml     container definition (JDK 21, restart: unless-stopped)
+extension/manifest.json      MV3 extension
+extension/inject.js          MAIN world: hooks Monaco, paints markers, completion provider
+extension/bridge.js          ISOLATED world: page ↔ extension message relay
+extension/background.js      service worker: talks to the local server
+extension/popup.*            popup (server status / port)
+docs/DESIGN.md               design document (English); docs/DESIGN.zh-CN.md (中文)
 ```
 
-## 手动测试服务
+## Testing the server by hand
 
 ```bash
 curl -s --data-binary @Solution.java http://127.0.0.1:47321/compile
 # {"ok":false,"ms":16,"diagnostics":[{"line":9,"col":20,"endLine":9,"endCol":21,"severity":"error","message":"..."}]}
 
-curl -s -H 'X-Lc-Offset: 103' --data-binary @Solution.java http://127.0.0.1:47321/complete   # 光标在第 103 个字符处
+curl -s -H 'X-Lc-Offset: 103' --data-binary @Solution.java http://127.0.0.1:47321/complete   # caret at character offset 103
 # {"ok":true,"ms":12,"incomplete":false,"items":[{"label":"peek","kind":"method","detail":"() : Integer",...}]}
 
-# 排查补全问题时打开调试日志
+# verbose completion logging
 LC_LIVE_DEBUG=1 server/start.sh
 ```

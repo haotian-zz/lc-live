@@ -1,86 +1,88 @@
-# lc-live 设计文档
+# lc-live Design Document
+
+English | [中文](DESIGN.zh-CN.md)
 
 | | |
 |---|---|
-| 状态 | 已实现 (v0.1) |
-| 作者 | haotian-zz |
-| 日期 | 2026-10-17 |
-| 范围 | Java；Chrome；macOS 本机或 Docker 部署 |
+| Status | Implemented (v0.1) |
+| Author | haotian-zz |
+| Date | 2026-10-17 |
+| Scope | Java; Chrome; macOS, run locally or in Docker |
 
-## 1. 背景与问题
+## 1. Background and problem
 
-在 Chrome 里刷 LeetCode 时，编辑器只有在点「Run」之后才会告诉你代码编不过。LeetCode 自带的 Auto（智能提示 / 检查）依赖它的远端服务，经常断线、延迟高、时有时无，无法当作可靠的工作流依赖。
+When solving LeetCode problems in Chrome, the editor only tells you that your code does not compile after you press "Run". LeetCode's built-in "Auto" assistant (IntelliSense and checking) depends on a remote service that frequently disconnects, lags, or silently stops working. It is not something a workflow can rely on.
 
-我们想要的是 IDE 的两项基本体验，并且完全跑在本机、不依赖 LeetCode 的任何后端：
+We want two basic IDE capabilities, running entirely on the local machine with no dependency on any LeetCode backend:
 
-1. **实时编译诊断**：停止输入后几百毫秒内，错误行出现波浪线和行尾提示。
-2. **自动补全**：类名前缀、`.` 后的成员（含泛型代入后的签名）、作用域内的变量和方法。
+1. **Live compile diagnostics**: within a few hundred milliseconds of pausing, offending lines show a squiggle and an end-of-line hint.
+2. **Completion**: class-name prefixes, members after `.` (with generics substituted in the signature), and variables and methods in scope.
 
-## 2. 目标与非目标
+## 2. Goals and non-goals
 
-**目标**
+**Goals**
 
-- 诊断和补全的端到端延迟在 100 ms 量级，感知上即时。
-- 诊断结果与 LeetCode 真实提交时的 javac 行为一致：相同的隐式 import、相同的辅助类（`ListNode`、`TreeNode`、`Node`、交互题的父类）。
-- 零第三方依赖。服务端只用 JDK 自带的 API；扩展只用 Chrome 原生 API。
-- 对页面无侵入：不改 LeetCode 的 DOM 结构，不劫持它的网络请求，随时可以关掉。
-- 一条命令部署，服务随系统自动拉起。
+- End-to-end latency on the order of 100 ms for both diagnostics and completion, so it feels instant.
+- Diagnostics that agree with what javac says on a real LeetCode submission: the same implicit imports and the same helper types (`ListNode`, `TreeNode`, `Node`, parents of interactive problems).
+- Zero third-party dependencies. The server uses only JDK APIs; the extension uses only Chrome APIs.
+- Non-invasive: no changes to LeetCode's DOM structure, no interception of its network traffic, and it can be switched off at any time.
+- One-command deployment with the server restarting automatically with the system.
 
-**非目标**
+**Non-goals**
 
-- 不运行用户代码，不跑测试用例。
-- 不做重构、跳转定义、格式化等完整语言服务器功能。
-- 暂不支持 Java 以外的语言（架构上预留了 `languages` 字段）。
-- 不处理 LeetCode 页面以外的编辑器。
+- Running user code or test cases.
+- Full language-server features such as refactoring, go-to-definition or formatting.
+- Languages other than Java for now (the architecture reserves a `languages` field).
+- Editors outside LeetCode pages.
 
-## 3. 总体架构
+## 3. Architecture overview
 
-系统由三个进程协作：LeetCode 页面里的 Monaco 编辑器、Chrome 扩展、本机常驻的 JVM 编译服务。
+Three processes cooperate: the Monaco editor inside the LeetCode page, the Chrome extension, and a persistent JVM compile server on the local machine.
 
 ```mermaid
 flowchart LR
-    subgraph Tab["Chrome 标签页 · leetcode.com"]
+    subgraph Tab["Chrome tab · leetcode.com"]
         direction LR
-        subgraph Main["页面 MAIN world"]
-            Monaco["Monaco 编辑器<br/>(LeetCode 自有)"]
-            Inject["inject.js<br/>监听 / 画标记 / 补全 provider"]
+        subgraph Main["page MAIN world"]
+            Monaco["Monaco editor<br/>(owned by LeetCode)"]
+            Inject["inject.js<br/>listen / paint / completion provider"]
         end
-        subgraph Iso["扩展 ISOLATED world"]
-            Bridge["bridge.js<br/>消息中转"]
+        subgraph Iso["extension ISOLATED world"]
+            Bridge["bridge.js<br/>message relay"]
         end
         Monaco <-- "monaco API" --> Inject
         Inject <-- "window.postMessage" --> Bridge
     end
-    BG["background.js<br/>扩展 service worker"]
+    BG["background.js<br/>extension service worker"]
     Bridge <-- "chrome.runtime.sendMessage" --> BG
-    Server["LcLiveServer<br/>常驻 JVM · javac 内存编译<br/>127.0.0.1:47321"]
+    Server["LcLiveServer<br/>persistent JVM · in-memory javac<br/>127.0.0.1:47321"]
     BG <-- "HTTP POST /compile · /complete" --> Server
 ```
 
-### 3.1 为什么是三跳
+### 3.1 Why three hops
 
-这条链路看起来绕，但每一跳都是被 Chrome 的隔离模型逼出来的：
+The path looks roundabout, but each hop is forced by Chrome's isolation model:
 
-| 约束 | 后果 |
+| Constraint | Consequence |
 |---|---|
-| `window.monaco` 是页面自己的 JS 对象，内容脚本默认运行在 ISOLATED world，看不到页面变量 | 操作编辑器的代码必须以 `world: "MAIN"` 注入 |
-| MAIN world 的脚本没有 `chrome.runtime` 等扩展 API | 需要一个 ISOLATED world 的中转脚本，两者通过 `postMessage` 通信 |
-| 从 `https://leetcode.com` 直接 `fetch("http://127.0.0.1")` 会触发 Chrome 的本地网络访问限制（实测请求会挂起） | 最终请求由扩展的 service worker 发出，它持有 `host_permissions`，不受此限制 |
+| `window.monaco` is a JavaScript object owned by the page; content scripts run in the ISOLATED world by default and cannot see page variables | Code that touches the editor must be injected with `world: "MAIN"` |
+| MAIN-world scripts have no extension APIs such as `chrome.runtime` | A relay script in the ISOLATED world is needed; the two talk via `postMessage` |
+| A `fetch("http://127.0.0.1")` from `https://leetcode.com` trips Chrome's local-network-access restriction (verified: the request hangs) | The request is ultimately made by the extension service worker, which holds `host_permissions` and is exempt |
 
-### 3.2 组件职责
+### 3.2 Component responsibilities
 
-| 组件 | 文件 | 职责 |
+| Component | File | Responsibility |
 |---|---|---|
-| 注入脚本 | `extension/inject.js` | 轮询等待 `window.monaco`；跟踪所有 `java` 语言的 model；防抖后发编译请求；把诊断画成 marker、整行背景、行尾提示；注册 `CompletionItemProvider`；右下角状态胶囊 |
-| 中转脚本 | `extension/bridge.js` | 把页面消息原样转给 service worker，把响应原样发回。无业务逻辑 |
-| Service worker | `extension/background.js` | 唯一和编译服务通信的地方。超时控制、端口配置（`chrome.storage`）、健康检查 |
-| 弹窗 | `extension/popup.*` | 显示服务状态，修改端口 |
-| 编译服务 | `server/LcLiveServer.java` | HTTP 服务；源码拼装；javac 内存编译；基于 Trees API 的补全；类名索引 |
-| 部署 | `Dockerfile`、`compose.yml`、`server/*.sh` | 容器化（JDK 21）或本机 launchd 两种自启方式 |
+| Injected script | `extension/inject.js` | Polls for `window.monaco`; tracks every model whose language is `java`; debounces and sends compile requests; paints diagnostics as markers, whole-line background and end-of-line hints; registers a `CompletionItemProvider`; shows the status pill |
+| Relay | `extension/bridge.js` | Forwards page messages to the service worker and responses back. No business logic |
+| Service worker | `extension/background.js` | The only component that talks to the compile server. Timeouts, port configuration (`chrome.storage`), health check |
+| Popup | `extension/popup.*` | Shows server status; lets the user change the port |
+| Compile server | `server/LcLiveServer.java` | HTTP server; source assembly; in-memory javac; Trees-API-based completion; class-name index |
+| Deployment | `Dockerfile`, `compose.yml`, `server/*.sh` | Container (JDK 21) or local launchd, both with automatic restart |
 
-## 4. 服务端接口
+## 4. Server API
 
-服务只监听回环地址，请求体是原始 Java 源码（`text/plain`），避免在零依赖的服务端写 JSON 解析器。
+The server listens on the loopback address only. Request bodies are raw Java source (`text/plain`), which avoids writing a JSON parser in a dependency-free server.
 
 ### `GET /health`
 
@@ -91,7 +93,7 @@ flowchart LR
 
 ### `POST /compile`
 
-请求体：编辑器 buffer 原文。
+Body: the editor buffer verbatim.
 
 ```json
 {"ok":false,"ms":16,"diagnostics":[
@@ -99,11 +101,11 @@ flowchart LR
    "message":"incompatible types: int cannot be converted to String"}]}
 ```
 
-行列号均为 1-based，且已映射回用户 buffer 的坐标。
+Lines and columns are 1-based and already mapped back to the user's buffer coordinates.
 
 ### `POST /complete`
 
-请求体：buffer 原文；请求头 `X-Lc-Offset`：光标在 buffer 中的 UTF-16 偏移（与 Monaco 的 `getOffsetAt` 一致）。
+Body: the buffer verbatim. Header `X-Lc-Offset`: the caret's UTF-16 offset in the buffer (identical to Monaco's `getOffsetAt`).
 
 ```json
 {"ok":true,"ms":12,"incomplete":false,"items":[
@@ -111,80 +113,80 @@ flowchart LR
    "insert":"peek()","snippet":false,"sort":"1peek"}]}
 ```
 
-`incomplete=true` 表示结果被截断（例如空前缀下不列全部 JDK 类型），Monaco 会在用户继续输入时重新请求。
+`incomplete=true` means the list was truncated (for example, the full JDK type list is not returned for an empty prefix); Monaco re-queries as the user keeps typing.
 
-## 5. 源码拼装（prepare）
+## 5. Source assembly (prepare)
 
-LeetCode 提交时会在用户代码外面包一层：隐式 import 一组包，并把题目相关的辅助类放进编译。为了让本地 javac 的判断和线上一致，服务端对每次请求做同样的拼装。
+When LeetCode submits, it wraps the user's code: a set of packages is imported implicitly and the problem's helper types are compiled alongside. To make local javac agree with the online judge, the server performs the same assembly on every request.
 
 ```mermaid
 flowchart TB
-    Buf["编辑器 buffer"] --> Strip["去掉块注释后扫描<br/>用户声明的类型名"]
-    Buf --> Comments["遍历块注释"]
-    Comments --> Extract["找到 class/interface 关键字<br/>从该行起按大括号配对截取<br/>去掉 public"]
-    Extract --> Units2["单元 2..n<br/>ListNode.java / TreeNode.java / Node.java …"]
-    Strip --> Stubs["仍未声明但被引用的名字<br/>→ 内置 stub"]
+    Buf["editor buffer"] --> Strip["strip block comments,<br/>scan for user-declared type names"]
+    Buf --> Comments["walk block comments"]
+    Comments --> Extract["find class/interface keyword,<br/>cut from that line to the matching brace,<br/>drop public"]
+    Extract --> Units2["units 2..n<br/>ListNode.java / TreeNode.java / Node.java …"]
+    Strip --> Stubs["names referenced but still undeclared<br/>→ built-in stubs"]
     Stubs --> Units2
-    Buf --> Main["单元 1 · Solution.java<br/>第 1 行: 全部 import 挤成一行<br/>第 2 行起: buffer 原文"]
+    Buf --> Main["unit 1 · Solution.java<br/>line 1: all imports on one line<br/>line 2 onward: buffer verbatim"]
     Main --> Javac["javac"]
     Units2 --> Javac
 ```
 
-设计要点：
+Design points:
 
-- **import 全部放在一行**。用户代码的行号只整体偏移 1，诊断映射只需减 1；多行 import 会让映射依赖 import 数量。
-- **注释里的定义是真的参与编译**。LeetCode 把 `ListNode` 等定义放在文件开头的 `/** ... */` 里，有时是 `/* // Definition for a Node. class Node {...} */` 的形式。服务端剥掉 `*` 和 `//` 前缀后，从 `class` 关键字所在行开始做大括号配对，截到对应的 `}`。前后的英文说明文字自然被丢弃。
-- **stub 只在缺失时补**。内置了 `ListNode`、`TreeNode`、`Node`（字段取各题的并集）、`NestedInteger`、`GuessGame`、`VersionControl`、`MountainArray` 等。只要用户代码或注释里已经声明同名类型就不注入，避免 duplicate class。
-- **辅助类型是独立编译单元**。它们不占用用户 buffer 的行号；如果 stub 自身报错，诊断会钉在第 1 行并加 `[in X.java]` 前缀而不是错位。
-- **单元命名**。用户代码里若有 `public class X`，主单元命名为 `X.java`，否则 `Solution.java`，满足 javac 对 public 类文件名的要求。
+- **All imports on a single line.** User lines shift by exactly 1, so mapping a diagnostic back is a subtraction; multi-line imports would make the mapping depend on how many imports there are.
+- **Definitions in comments really are compiled.** LeetCode places `ListNode` and friends in a `/** ... */` block at the top of the file, sometimes as `/* // Definition for a Node. class Node {...} */`. The server strips the `*` and `//` prefixes, then starts at the line containing the `class` keyword and cuts to the matching `}` by brace counting. The surrounding prose falls away naturally.
+- **Stubs only when missing.** Built-in stubs exist for `ListNode`, `TreeNode`, `Node` (fields are the union across problems), `NestedInteger`, `GuessGame`, `VersionControl`, `MountainArray` and others. A stub is injected only if neither the user's code nor a comment already declares that name, avoiding duplicate-class errors.
+- **Helper types are separate compilation units.** They do not consume lines of the user's buffer. If a stub itself fails to compile, the diagnostic is pinned to line 1 with an `[in X.java]` prefix rather than being misplaced.
+- **Unit naming.** If the user's code contains `public class X`, the main unit is named `X.java`, otherwise `Solution.java`, satisfying javac's file-name rule for public classes.
 
-## 6. 诊断链路
+## 6. Diagnostics pipeline
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户
+    participant U as User
     participant M as Monaco
     participant I as inject.js
     participant B as bridge → background
     participant S as LcLiveServer
-    U->>M: 输入
+    U->>M: types
     M->>I: onDidChangeContent
-    Note over I: 防抖 400 ms，记录 versionId
+    Note over I: debounce 400 ms, remember versionId
     I->>B: {type:"compile", code}
     B->>S: POST /compile
-    Note over S: prepare() → JavaCompiler.getTask().call()<br/>内存 FileManager，class 输出丢弃
-    S-->>B: diagnostics (行号已 -1)
+    Note over S: prepare() → JavaCompiler.getTask().call()<br/>in-memory FileManager, class output discarded
+    S-->>B: diagnostics (lines already -1)
     B-->>I: payload
-    Note over I: versionId 变了？→ 丢弃并重新调度
-    I->>M: setModelMarkers（波浪线、悬停、概览条）
-    I->>M: deltaDecorations（整行背景 + afterContentClassName）
-    I->>I: 重写 <style>：.lc-live-mX-i::after{content:"⟵ 消息"}
+    Note over I: versionId changed? → drop and reschedule
+    I->>M: setModelMarkers (squiggles, hover, overview ruler)
+    I->>M: deltaDecorations (whole-line background + afterContentClassName)
+    I->>I: rewrite <style>: .lc-live-mX-i::after{content:"⟵ message"}
 ```
 
-### 6.1 编译选项
+### 6.1 Compiler options
 
 ```
 -proc:none -Xlint:none -g:none -Xmaxerrs 200 -encoding UTF-8 -XDshould-stop.ifError=FLOW
 ```
 
-`-XDshould-stop.ifError=FLOW` 是关键。javac 默认遇到语法错误就停在解析阶段，只报「`';' expected`」；打开后它会继续完成属性分析和流分析，于是缺分号和未定义变量会同时报出来，这才是 IDE 的行为。
+`-XDshould-stop.ifError=FLOW` is the important one. By default javac stops after parsing when it sees a syntax error and reports only `';' expected`. With this flag it continues through attribution and flow analysis, so a missing semicolon and an undefined variable are reported together, which is what an IDE does.
 
-### 6.2 错误范围
+### 6.2 Error ranges
 
-javac 给出的是字符偏移 `start/end`。对零宽度的诊断（比如缺分号指向上一个 token 的末尾），服务端把范围向右扩到标识符结尾，或至少扩一列，保证 Monaco 有可见的波浪线，且不跨行。客户端再按 model 的实际行长做一次钳制。
+javac supplies character offsets `start/end`. For zero-width diagnostics (a missing semicolon points at the end of the previous token) the server extends the range to the end of the identifier, or by at least one column, so Monaco has a visible squiggle, without crossing a line break. The client clamps the range once more against the model's real line lengths.
 
-### 6.3 行尾提示为什么用 CSS 伪元素
+### 6.3 Why the end-of-line hint is a CSS pseudo-element
 
-Monaco 有两种在行尾画文字的方式：
+Monaco offers two ways to draw text at the end of a line:
 
-| 方式 | 机制 | 问题 |
+| Approach | Mechanism | Problem |
 |---|---|---|
-| `after: { content }` (injected text) | 文字作为真实 DOM 文本插入视图行 | 会被鼠标选中、整行选择时高亮覆盖它、光标可停在上面 |
-| `afterContentClassName` + `::after` | 只插入一个空 `<span>`，文字由 CSS `content` 画 | 伪元素不在 DOM 文本里：选不中、复制不到、光标落不上 |
+| `after: { content }` (injected text) | The text is inserted into the view line as real DOM text | It can be selected with the mouse, whole-line selection highlights it, and the caret can stop on it |
+| `afterContentClassName` + `::after` | Only an empty `<span>` is inserted; the text is drawn by CSS `content` | A pseudo-element is not DOM text: it cannot be selected, copied or landed on |
 
-选择后者。每次应用诊断时，为每条消息生成一个唯一类名并重写一个 `<style>` 元素；清除诊断时清空它。类名包含 model id，多个 model 互不干扰。
+The second approach is used. Each time diagnostics are applied, a unique class name is generated per message and a single `<style>` element is rewritten; clearing diagnostics empties it. Class names include the model id, so multiple models do not interfere.
 
-## 7. 补全链路
+## 7. Completion pipeline
 
 ```mermaid
 sequenceDiagram
@@ -193,108 +195,108 @@ sequenceDiagram
     participant S as LcLiveServer
     M->>I: provideCompletionItems(model, position)
     I->>S: POST /complete (buffer, X-Lc-Offset)
-    Note over S: 1. 从光标向前扫标识符 → prefix<br/>再向前跳空格，遇 '.' → 成员模式，否则作用域模式<br/>光标在注释/字符串里 → 直接返回空
-    Note over S: 2. prepare() → JavacTask.parse() + analyze()<br/>只分析，不生成字节码
-    alt 成员模式
-        Note over S: 3a. 找 MemberSelect 节点：表达式结束位置 ≤ '.' 且最靠近<br/>trees.getTypeMirror(表达式) → 类型<br/>elements.getAllMembers() → 成员<br/>types.asMemberOf() → 代入泛型实参<br/>trees.isAccessible() → 过滤私有
-    else 作用域模式
-        Note over S: 3b. trees.getScope(光标) → 沿作用域链收集局部变量/参数<br/>getAllMembers(当前类) → 字段、方法<br/>类名索引（前缀 / 驼峰匹配）→ JDK 类型<br/>关键字
+    Note over S: 1. scan backwards over identifier chars → prefix<br/>skip spaces; '.' → member mode, else scope mode<br/>caret inside comment/string → return empty
+    Note over S: 2. prepare() → JavacTask.parse() + analyze()<br/>analysis only, no bytecode
+    alt member mode
+        Note over S: 3a. find MemberSelect node whose expression ends at/before the '.'<br/>trees.getTypeMirror(expression) → type<br/>elements.getAllMembers() → members<br/>types.asMemberOf() → substitute type arguments<br/>trees.isAccessible() → drop private members
+    else scope mode
+        Note over S: 3b. trees.getScope(caret) → locals and parameters along the scope chain<br/>getAllMembers(enclosing class) → fields, methods<br/>class-name index (prefix / camel-hump match) → JDK types<br/>keywords
     end
     S-->>I: items (label, kind, detail, insert, sort)
-    I->>M: CompletionItem[]（snippet 插入 name($1)）
+    I->>M: CompletionItem[] (snippet insert name($1))
 ```
 
-### 7.1 处理「写了一半」的代码
+### 7.1 Handling half-typed code
 
-正在输入 `dq.pe` 的那一行必然还没有分号。javac 的解析器会报错但继续恢复，把这条语句包进一个 `Erroneous` 节点，而 `dq.pe` 本身被解析为 `MemberSelect(dq, pe)`；若 `.` 后面什么都没有，名字会是 `<error>`。两个坑：
+The line being typed, `dq.pe`, necessarily lacks its semicolon. javac's parser reports the error and recovers, wrapping the statement in an `Erroneous` node while `dq.pe` itself is parsed as `MemberSelect(dq, pe)`; if nothing follows the `.`, the name is `<error>`. Two pitfalls:
 
-1. `com.sun.source.util.TreeScanner` 的 `visitErroneous` 默认**不**遍历子树，`Trees.getPath()` 内部同样如此。服务端覆写了 `visitErroneous` 让遍历进入 `getErrorTrees()`，并用 `TreePathScanner` 自己记录路径，而不是事后调用 `getPath()`。
-2. 好在 `Attr` 阶段会给 `Erroneous` 内部的子树赋类型，所以 `dq` 的 `TypeMirror` 是可用的。这依赖 §6.1 的 `should-stop.ifError=FLOW`，否则分析根本不会执行。
+1. `com.sun.source.util.TreeScanner.visitErroneous` does **not** descend into the subtree by default, and `Trees.getPath()` behaves the same way. The server overrides `visitErroneous` to scan `getErrorTrees()` and records the path itself with a `TreePathScanner` instead of calling `getPath()` afterwards.
+2. Fortunately the `Attr` phase does assign types to subtrees inside `Erroneous`, so the `TypeMirror` of `dq` is available. This relies on `should-stop.ifError=FLOW` from §6.1; without it, analysis would not run at all.
 
-### 7.2 类型分派
+### 7.2 Dispatch by expression type
 
-| 表达式 | 处理 |
+| Expression | Handling |
 |---|---|
-| 变量、方法调用、字面量、`this` | `DeclaredType` → `getAllMembers`，只列非静态成员 |
-| 类型名（`Math.`、`Collections.`） | 只列静态成员，外加 `class` |
-| 数组 | 加 `length`，其余按 `Object` 处理 |
-| 类型变量 `T` | 取上界后处理 |
-| 包名（`java.util.`） | 列包内公开类型 |
-| 无法解析（`ErrorType`） | 返回空 |
+| Variable, method call, literal, `this` | `DeclaredType` → `getAllMembers`, instance members only |
+| Type name (`Math.`, `Collections.`) | Static members only, plus `class` |
+| Array | Add `length`, then treat as `Object` |
+| Type variable `T` | Use its upper bound |
+| Package name (`java.util.`) | List the package's public types |
+| Unresolvable (`ErrorType`) | Return empty |
 
-### 7.3 排序与匹配
+### 7.3 Ordering and matching
 
-`sort` 字段用一位数字前缀把候选分层，Monaco 按它排序后再按 label：
+The `sort` field carries a one-digit prefix that tiers the candidates; Monaco orders by it and then by label:
 
 ```
-0 局部变量/参数  <  1 本类或接收者类型自身的成员  <  2 java.util / java.lang 类型
-<  3 继承自 Object 的方法  <  4 其他包的类型  <  5 关键字
+0 locals/parameters  <  1 members of the current class or receiver type  <  2 java.util / java.lang types
+<  3 methods inherited from Object  <  4 types from other packages  <  5 keywords
 ```
 
-匹配规则：大小写不敏感的前缀匹配，另支持驼峰缩写（`ADe` → `ArrayDeque`、`HM` → `HashMap`）。驼峰匹配要求至少两个字符且首字母相同，否则单个字母会匹配到大量无关类型。
+Matching is case-insensitive prefix matching plus camel-hump abbreviations (`ADe` → `ArrayDeque`, `HM` → `HashMap`). Camel-hump matching requires at least two characters and a matching first letter; otherwise a single letter matches a large number of unrelated types.
 
-### 7.4 类名索引
+### 7.4 Class-name index
 
-启动时在后台线程用 `Elements.getPackageElement(pkg).getEnclosedElements()` 枚举 LeetCode 隐式导入的包（`java.lang`、`java.util`、`java.util.stream`、`java.util.function`、`java.math`、`java.util.concurrent`、`java.io`、`java.text`、`java.util.regex`、`java.lang.reflect` 等），只保留 `public` 顶层类型，约 490 个，耗时不到 100 ms。索引内容只有名字、包、种类三个字符串，与具体的 javac 任务无关，可长期缓存。
+At startup a background thread enumerates the packages LeetCode imports implicitly (`java.lang`, `java.util`, `java.util.stream`, `java.util.function`, `java.math`, `java.util.concurrent`, `java.io`, `java.text`, `java.util.regex`, `java.lang.reflect`, …) via `Elements.getPackageElement(pkg).getEnclosedElements()`, keeping only `public` top-level types: about 490 entries in under 100 ms. The index holds only three strings per entry (name, package, kind), is independent of any particular javac task, and can be cached indefinitely.
 
-### 7.5 客户端
+### 7.5 Client side
 
-- LeetCode 创建的 Monaco 把 `quickSuggestions` 关了，因此只有输入 `.` 才会弹框。扩展在跟踪到的 Java 编辑器上调用 `updateOptions` 打开它，并关闭 Monaco 自带的基于单词的补全以免混入噪音。
-- 有参方法以 snippet 形式插入 `name($1)`，光标停在括号内；无参方法插入 `name()`。
-- 同一个单词内继续输入时，Monaco 用上次结果本地过滤，不再请求服务端；只有新单词或 `.` 才会打到服务端。
+- The Monaco instance LeetCode creates has `quickSuggestions` off, so nothing pops up until `.` is typed. The extension calls `updateOptions` on tracked Java editors to turn it on and disables Monaco's word-based suggestions to keep noise out.
+- Methods with parameters are inserted as the snippet `name($1)` with the caret inside the parentheses; parameterless methods insert `name()`.
+- While the user keeps typing within the same word, Monaco filters the previous result locally and does not re-query; only a new word or a `.` reaches the server.
 
-## 8. 一致性与并发
+## 8. Consistency and concurrency
 
-- `compile()` 与 `complete()` 都用服务实例级别的锁串行化：javac 的 `StandardJavaFileManager` 不保证线程安全，而单用户场景下串行完全够用。
-- 客户端记录发送请求时的 `model.getVersionId()`；响应回来时若版本已变，直接丢弃并重新调度，避免把旧诊断画到新代码上。
-- 每个 model 同一时刻最多一个在途编译请求，期间的变更合并为一个 `dirty` 标记。
-- 服务不可达时客户端进入 offline 状态，清空标记，每 5 s 重试一次；补全在 offline 期间直接返回空，不阻塞编辑。
+- `compile()` and `complete()` are serialised with a lock on the server instance: javac's `StandardJavaFileManager` is not guaranteed thread-safe, and serial execution is ample for a single user.
+- The client records `model.getVersionId()` when it sends a request; if the version has changed by the time the response arrives, the result is dropped and a new compile is scheduled, so stale diagnostics are never painted over new code.
+- At most one compile request is in flight per model; changes during that window collapse into a single `dirty` flag.
+- When the server is unreachable the client enters an offline state, clears markers and retries every 5 s; completion returns empty immediately while offline and never blocks editing.
 
-## 9. 性能
+## 9. Performance
 
-| 环节 | 做法 | 效果 |
+| Area | Approach | Effect |
 |---|---|---|
-| 进程 | JVM 常驻，启动时先编译一个样例预热 JIT | 首次请求也在几十毫秒 |
-| I/O | 源码是 `SimpleJavaFileObject`，class 输出写入丢弃流 | 全程不落盘 |
-| 补全 | 只到 `analyze()`，不做 `generate()` | 省掉代码生成 |
-| 请求量 | 400 ms 防抖 + versionId 去重 + Monaco 本地过滤 | 正常打字每秒不超过两三次请求 |
-| JVM 参数 | `-Xms64m -Xmx512m -XX:+UseSerialGC -XX:TieredStopAtLevel=1` | 内存小，启动快，C1 对这种短任务足够 |
+| Process | Persistent JVM; compiles a sample at startup to warm the JIT | Even the first request takes tens of milliseconds |
+| I/O | Sources are `SimpleJavaFileObject`s; class output goes to a discarding stream | Nothing touches the disk |
+| Completion | Stops at `analyze()`, never calls `generate()` | Code generation skipped |
+| Request volume | 400 ms debounce + versionId de-duplication + Monaco's local filtering | Two or three requests per second at most during normal typing |
+| JVM flags | `-Xms64m -Xmx512m -XX:+UseSerialGC -XX:TieredStopAtLevel=1` | Small footprint, fast start; C1 is enough for short tasks |
 
-实测：典型题目的编译 10–25 ms，补全 10–30 ms，端到端感知即时。
+Measured: 10–25 ms to compile a typical problem, 10–30 ms per completion; end to end it feels instant.
 
-## 10. 安全与隐私
+## 10. Security and privacy
 
-- 服务只处理源码文本，不执行任何用户代码（没有 `generate` 之后的加载和运行）。
-- 本机运行时绑定 `127.0.0.1`；Docker 运行时容器内绑 `0.0.0.0`，但端口只发布到宿主 `127.0.0.1`，局域网不可达。
-- 扩展的 `host_permissions` 只包含 `127.0.0.1` 和 `localhost`，内容脚本只匹配 `leetcode.com` 和 `leetcode.cn`。
-- 代码不会离开本机。CORS 头虽然放开，但实际只有扩展 service worker 会访问。
-- 请求体上限 512 KB。
+- The server processes source text only and never executes user code (nothing is loaded or run after `generate`, which is never invoked for completion and whose output is discarded for compilation).
+- Running locally it binds `127.0.0.1`; in Docker the container binds `0.0.0.0` but the port is published to the host's `127.0.0.1` only, so it is unreachable from the LAN.
+- The extension's `host_permissions` cover only `127.0.0.1` and `localhost`; content scripts match only `leetcode.com` and `leetcode.cn`.
+- Code never leaves the machine. CORS headers are permissive, but in practice only the extension service worker ever connects.
+- Request bodies are capped at 512 KB.
 
-## 11. 部署
+## 11. Deployment
 
 ```mermaid
 flowchart LR
-    subgraph A["方式 A · Docker（推荐）"]
-        D1["eclipse-temurin:21-jdk-alpine<br/>构建时 javac 预编译"] --> D2["restart: unless-stopped<br/>127.0.0.1:47321:47321<br/>healthcheck /health"]
+    subgraph A["Option A · Docker (recommended)"]
+        D1["eclipse-temurin:21-jdk-alpine<br/>javac precompiled at build time"] --> D2["restart: unless-stopped<br/>127.0.0.1:47321:47321<br/>healthcheck /health"]
     end
-    subgraph B["方式 B · 本机 JDK"]
+    subgraph B["Option B · local JDK"]
         L1["server/start.sh<br/>java LcLiveServer.java"] --> L2["install-launchd.sh<br/>LaunchAgent KeepAlive"]
     end
 ```
 
-Docker 方式的好处是 JDK 版本与 LeetCode 一致（21），不受本机 JDK 影响；容器随 docker daemon 自动恢复。daemon 自身的开机启动由后端负责（如 `brew services start colima`）。两种方式都占用 47321 端口，二选一。
+Docker's advantage is JDK parity with LeetCode (21) regardless of the local JDK, and the container recovers with the Docker daemon. Whether the daemon starts at login is handled by the backend (for example `brew services start colima`). Both options use port 47321, so run only one.
 
-## 12. 已知限制与后续工作
+## 12. Known limitations and future work
 
-- **语言**：目前只有 Java。架构上 `/health` 的 `languages` 字段和客户端按 `languageId` 分派已预留扩展点；C++ 可用 clangd，Python 可用 pyright，都需要新的服务端实现。
-- **诊断粒度**：javac 对某些语法错误的恢复会产生级联误报，IDE 也有同样问题，但 IntelliJ 的恢复更好。
-- **补全范围**：不含参数名提示（JDK class 文件不带参数名）、不含 import 外的类型、不含构造器参数提示、不含文档注释。
-- **编辑器版本**：依赖 Monaco 的 `afterContentClassName`，已在当前 LeetCode 使用的版本上验证；若 LeetCode 升级 Monaco 移除该选项，需切换为 content widget 实现。
-- **多 model**：状态胶囊只跟随当前编辑器，分屏场景只显示一个。
-- **扩展分发**：目前以「加载已解压的扩展程序」方式安装，未上架商店。
+- **Languages**: Java only. The `languages` field in `/health` and the client's dispatch by `languageId` are the extension points; C++ could use clangd and Python pyright, each needing a new server implementation.
+- **Diagnostic quality**: javac's recovery from some syntax errors produces cascading false positives. IDEs share the problem, though IntelliJ recovers better.
+- **Completion coverage**: no parameter-name hints (JDK class files do not carry them), no types outside the implicit imports, no constructor parameter hints, no documentation comments.
+- **Editor version**: relies on Monaco's `afterContentClassName`, verified on the version LeetCode currently ships. If a future Monaco drops the option, switch to a content-widget implementation.
+- **Multiple models**: the status pill follows a single editor; in split views only one is shown.
+- **Distribution**: installed via "Load unpacked"; not published to the Web Store.
 
-## 13. 测试
+## 13. Testing
 
-- 服务端：`curl` 直接打 `/compile` 和 `/complete`，覆盖普通错误、链表题注释定义、Node 图题、LRUCache 设计题、`public class Solution extends GuessGame`、数组、`this`、链式调用、字符串字面量接收者、注释/字符串内不触发等场景。
-- 客户端：在真实 LeetCode 页面注入等价脚本，验证 marker 渲染、伪元素提示的不可选中性、CompletionItemProvider 被调用且候选正确显示。
-- 调试：`LC_LIVE_DEBUG=1` 打开服务端补全日志；浏览器 DevTools 里 `__lcLive.status()` 查看扩展连接状态。
+- Server: `curl` against `/compile` and `/complete`, covering a plain error, linked-list problems with the comment definition, the Node graph problem, the LRUCache design problem, `public class Solution extends GuessGame`, arrays, `this`, chained calls, string-literal receivers, and no triggering inside comments or strings.
+- Client: an equivalent script injected into a real LeetCode page, verifying marker rendering, that pseudo-element hints are unselectable, and that the `CompletionItemProvider` is invoked and shows the right candidates.
+- Debugging: `LC_LIVE_DEBUG=1` enables server-side completion logging; `__lcLive.status()` in the browser DevTools shows the extension's connection state.
