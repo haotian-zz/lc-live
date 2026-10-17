@@ -1,0 +1,11 @@
+services:
+  lc-live:
+    build: .
+    image: lc-live:latest
+    container_name: lc-live
+    # Comes back on daemon start (reboot) unless you explicitly `docker compose stop` it.
+    restart: unless-stopped
+    # Published to host loopback only; nothing else on your network can reach it.
+    ports:
+      - "127.0.0.1:47321:47321"
+    mem_limit: 768m
